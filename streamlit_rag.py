@@ -1,4 +1,5 @@
 import os
+import zipfile
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
@@ -7,7 +8,7 @@ from langchain_chroma import Chroma
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.messages import SystemMessage, HumanMessage
 
-st.set_page_config(page_title="Avaneesh Konda RAG Interface", layout="wide")
+st.set_page_config(page_title="Datta Lab RAG", layout="wide")
 
 st.title("Datta Lab RAG Interface")
 st.caption("Semantic Knowledge Extraction & Automated Iterative Gap Analysis")
@@ -37,6 +38,13 @@ open_api_key = os.getenv("OPENAI_API_KEY")
 def load_vector_store():
     embeddings = OpenAIEmbeddings()
     persist_directory = './chroma_db'
+    zip_path = './chroma_db.zip'
+    
+    if not os.path.exists(persist_directory) and os.path.exists(zip_path):
+        st.text("Unzipping pre-built vector database...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall('.')
+            
     if os.path.exists(persist_directory):
         st.text("Database found! Loading existing vector store...")
         return Chroma(persist_directory=persist_directory, embedding_function=embeddings)
