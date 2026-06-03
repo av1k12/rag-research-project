@@ -10,7 +10,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 st.set_page_config(page_title="Datta Lab RAG", layout="wide")
 
-st.title("Datta Lab RAG Interface")
+st.title("Avaneesh Konda RAG Interface")
 st.caption("Semantic Knowledge Extraction & Automated Iterative Gap Analysis")
 
 with st.expander("ℹ️ App Instructions & Operational Modes", expanded=True):
