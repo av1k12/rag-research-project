@@ -1,5 +1,6 @@
 import os
 import zipfile
+import ssl
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
@@ -7,6 +8,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_neo4j import Neo4jGraph
 
 st.set_page_config(page_title="RAG", layout="wide")
 
@@ -18,9 +20,9 @@ with st.expander("ℹ️ App Instructions & Operational Modes", expanded=True):
     with col1:
         st.markdown("### General Inquiry Mode")
         st.write(
-            "Designed for standard document lookup. It pulls the top semantic text chunks "
-            "matching your prompt and extracts concrete metrics or definitions. If the "
-            "context does not contain the answer, it returns an explicit 'I do not know' statement."
+            "Designed for standard document lookup. It pulls context matching your prompt "
+            "and extracts concrete metrics or definitions. If the context does not contain "
+            "the answer, it returns an explicit 'I do not know' statement."
         )
     with col2:
         st.markdown("### Research Gap Analysis Mode")
@@ -33,10 +35,17 @@ with st.expander("ℹ️ App Instructions & Operational Modes", expanded=True):
 
 load_dotenv()
 open_api_key = os.getenv("OPENAI_API_KEY")
+embeddings = OpenAIEmbeddings()
+
+# --- Backend Engine Switcher (Sidebar Integration) ---
+st.sidebar.header("Engine Configuration")
+engine_mode = st.sidebar.radio(
+    "Select Search Infrastructure:",
+    ("Vector Database (Chroma)", "Knowledge Graph (Neo4j)")
+)
 
 @st.cache_resource
 def load_vector_store():
-    embeddings = OpenAIEmbeddings()
     persist_directory = './chroma_db'
     zip_path = './chroma_db.zip'
     
@@ -46,7 +55,6 @@ def load_vector_store():
             zip_ref.extractall('.')
             
     if os.path.exists(persist_directory):
-        st.text("Database found! Loading existing vector store...")
         return Chroma(persist_directory=persist_directory, embedding_function=embeddings)
     else:
         st.text("No database found. Creating new one (this will cost OpenAI credits)...")
@@ -55,16 +63,82 @@ def load_vector_store():
         splitter = SemanticChunker(embeddings, breakpoint_threshold_type="standard_deviation")
         document_chunks = splitter.split_documents(docs)
         db = Chroma.from_documents(documents=document_chunks, embedding=embeddings, persist_directory=persist_directory)
-        st.text("Database created and saved!")
         return db
 
+@st.cache_resource
+def load_knowledge_graph():
+    custom_ssl_context = ssl.create_default_context()
+    custom_ssl_context.check_hostname = False
+    custom_ssl_context.verify_mode = ssl.CERT_NONE
+
+    raw_uri = os.getenv("NEO4J_URI")
+    if not raw_uri:
+        return None
+        
+    if raw_uri.startswith("neo4j+s://"):
+        processed_uri = raw_uri.replace("neo4j+s://", "neo4j://")
+    elif raw_uri.startswith("bolt+s://"):
+        processed_uri = raw_uri.replace("bolt+s://", "bolt://")
+    else:
+        processed_uri = raw_uri
+
+    return Neo4jGraph(
+        url=processed_uri,
+        username=os.getenv("NEO4J_USERNAME"),
+        password=os.getenv("NEO4J_PASSWORD"),
+        driver_config={"ssl_context": custom_ssl_context}
+    )
+
 vector_store = load_vector_store()
+graph_store = load_knowledge_graph()
+
 llm = ChatOpenAI(model="gpt-4o-mini", api_key=open_api_key, temperature=0)
 MAX_DEPTH = 3
 
-def get_rag_response(question):
-    retrieved_docs = vector_store.similarity_search(question, k=5)
-    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+def get_graph_rag_context(question):
+    if not graph_store:
+        return "Neo4j credentials not configured."
+        
+    query_vector = embeddings.embed_query(question)
+    
+    hybrid_cypher = """
+    CALL db.index.vector.queryNodes('entity_embeddings', 3, $vector)
+    YIELD node, score
+    MATCH (node)-[r]->(neighbor)
+    RETURN node.id + ' -> ' + type(r) + ' -> ' + neighbor.id AS relationship
+    LIMIT 15
+    """
+    
+    try:
+        result = graph_store.query(hybrid_cypher, params={"vector": query_vector})
+        context = "\n".join([row['relationship'] for row in result])
+    except Exception:
+        context = ""
+        
+    if not context.strip():
+        keywords = [w for w in question.split() if len(w) > 2]
+        if keywords:
+            fallback_cypher = """
+            MATCH (e:__Entity__) WHERE toLower(e.id) CONTAINS toLower($word)
+            MATCH (e)-[r]->(neighbor)
+            RETURN e.id + ' -> ' + type(r) + ' -> ' + neighbor.id AS relationship
+            LIMIT 10
+            """
+            target_word = keywords[-1] if len(keywords) > 1 else keywords[0]
+            try:
+                result = graph_store.query(fallback_cypher, params={"word": target_word})
+                context = "\n".join([row['relationship'] for row in result])
+            except Exception:
+                context = ""
+                
+    return context
+
+def get_rag_response(question, mode):
+    if "Vector Database" in mode:
+        retrieved_docs = vector_store.similarity_search(question, k=5)
+        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    else:
+        context = get_graph_rag_context(question)
 
     answer_prompt = f"""
     You are a PHD level research assistant identifying knowledge gaps in scientific literature.
@@ -119,7 +193,7 @@ if quest == "Find Gap Mode (g)":
             visited_questions = set()
             identified_gaps = []
 
-            st.markdown("### Execution Progress")
+            st.markdown(f"### Execution Progress ({engine_mode})")
             
             while queue:
                 current_question, depth = queue.pop(0)
@@ -131,7 +205,7 @@ if quest == "Find Gap Mode (g)":
                 
                 with st.status(f"Depth {depth} | {current_question[:60]}...", expanded=True) as status:
                     st.write(f"**Question:** {current_question}")
-                    answer = get_rag_response(current_question)
+                    answer = get_rag_response(current_question, engine_mode)
 
                     if "KNOWLEDGE_GAP_DETECTED" in answer:
                         st.error(f"GAP FOUND")
@@ -167,9 +241,12 @@ elif quest == "General Inquiry Mode (q)":
         elif question.strip().lower() == 'q':
             st.info("Inquiry session halted.")
         else:
-            with st.spinner("Retrieving document chunks..."):
-                retrieved_docs = vector_store.similarity_search(question, k=5)
-                context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+            with st.spinner(f"Retrieving from {engine_mode}..."):
+                if "Vector Database" in engine_mode:
+                    retrieved_docs = vector_store.similarity_search(question, k=5)
+                    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+                else:
+                    context = get_graph_rag_context(question)
 
                 answer_prompt = f"""
                 You are a PHD level research assistant helping answer researchers questions.
